@@ -7,7 +7,7 @@
 #define ENCODER_PPR             512
 #define ENCODER_COUNTS_PER_REV  (ENCODER_PPR * 4)
 
-volatile int32_t VEL_WINDOW_MS = 90U;   // rolling window target (ms)
+volatile int32_t VEL_WINDOW_MS = 40U;   // rolling window target (ms)
 
 // Extra smoothing after the rolling window:
 // 3 => 1/8 smoothing, 4 => 1/16 smoothing (more smooth, more delay)
