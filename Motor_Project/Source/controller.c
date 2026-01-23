@@ -30,9 +30,9 @@ volatile int32_t I_CLAMP_Q30 = 300000000;
 #define CTRL_MAX   ((int32_t)0x3FFFFFFF)
 #define CTRL_MIN   ((int32_t)0xC0000000)
 
-static int32_t  i_q30 = 0;
-static uint32_t last_ms = 0;
-static uint8_t  first_call = 1;
+static int32_t  integrator_q30 = 0;
+static uint32_t last_update_ms = 0;
+static uint8_t  is_first_call = 1;
 
 /* ===================== Helpers ===================== */
 
@@ -68,76 +68,76 @@ int32_t Controller_PIController(const int32_t* reference,
                                 const int32_t* measured,
                                 const uint32_t* millisec)
 {
-    if (first_call)
+    if (is_first_call)
     {
-        first_call = 0;
-        last_ms = *millisec;
-        i_q30 = 0;
+        is_first_call = 0;
+        last_update_ms = *millisec;
+        integrator_q30 = 0;
         return 0;
     }
 
-    uint32_t dt_ms = *millisec - last_ms;
-    last_ms = *millisec;
-    if (dt_ms == 0U) return 0;
+    uint32_t delta_ms = *millisec - last_update_ms;
+    last_update_ms = *millisec;
+    if (delta_ms == 0U) return 0;
 
-    int32_t r_rpm = *reference;
-    int32_t y_rpm = *measured;
-    int32_t e_rpm = r_rpm - y_rpm;
+    int32_t ref_rpm = *reference;
+    int32_t meas_rpm = *measured;
+    int32_t err_rpm = ref_rpm - meas_rpm;
 
     // Deadband for noise
-    if (iabs32(e_rpm) <= ERR_DEADBAND_RPM)
-        e_rpm = 0;
+    if (iabs32(err_rpm) <= ERR_DEADBAND_RPM)
+        err_rpm = 0;
 
     // Optional feedforward
-    int32_t u_ff_q30 = 0;
+    int32_t ff_q30 = 0;
 #if USE_FEEDFORWARD
-    u_ff_q30 = sat_ctrl((int64_t)U_PER_RPM * (int64_t)r_rpm);
+    ff_q30 = sat_ctrl((int64_t)U_PER_RPM * (int64_t)ref_rpm);
 #endif
 
     // Normalize error to Q15
-    int32_t e_q15 = clamp_q15(((int64_t)e_rpm * 32768LL) / (int64_t)RPM_SCALE);
+    int32_t err_q15 = clamp_q15(((int64_t)err_rpm * 32768LL) / (int64_t)RPM_SCALE);
 
     // P term: Q15*Q15 -> Q30 units
-    int32_t p_q30 = sat_ctrl((int64_t)Kp_q15 * (int64_t)e_q15);
+    int32_t p_term_q30 = sat_ctrl((int64_t)Kp_q15 * (int64_t)err_q15);
 
     // Integration window scales with reference magnitude
-    int32_t r_abs = iabs32(r_rpm);
-    int32_t win_rpm = (int32_t)(((int64_t)r_abs * (int64_t)INT_WINDOW_PCT) / 100LL);
-    if (win_rpm < ABS_INT_WINDOW_RPM) win_rpm = ABS_INT_WINDOW_RPM;
+    int32_t ref_abs = iabs32(ref_rpm);
+    int32_t int_window_rpm = (int32_t)(((int64_t)ref_abs * (int64_t)INT_WINDOW_PCT) / 100LL);
+    if (int_window_rpm < ABS_INT_WINDOW_RPM) int_window_rpm = ABS_INT_WINDOW_RPM;
 
     // I update only when close enough
-    int32_t i_candidate = i_q30;
-    if (iabs32(e_rpm) <= win_rpm)
+    int32_t integrator_candidate = integrator_q30;
+    if (iabs32(err_rpm) <= int_window_rpm)
     {
-        int64_t di_q30 = ((int64_t)Ki_q15 * (int64_t)e_q15 * (int64_t)dt_ms) / 1000LL;
-        i_candidate = sat_ctrl((int64_t)i_q30 + di_q30);
-        i_candidate = clamp_i32(i_candidate, -I_CLAMP_Q30, I_CLAMP_Q30);
+        int64_t di_q30 = ((int64_t)Ki_q15 * (int64_t)err_q15 * (int64_t)delta_ms) / 1000LL;
+        integrator_candidate = sat_ctrl((int64_t)integrator_q30 + di_q30);
+        integrator_candidate = clamp_i32(integrator_candidate, -I_CLAMP_Q30, I_CLAMP_Q30);
     }
 
     // Anti-windup using saturation check
-    int64_t u_cand_ll = (int64_t)u_ff_q30 + (int64_t)p_q30 + (int64_t)i_candidate;
-    int32_t u_sat = sat_ctrl(u_cand_ll);
+    int64_t control_candidate_ll = (int64_t)ff_q30 + (int64_t)p_term_q30 + (int64_t)integrator_candidate;
+    int32_t control_sat = sat_ctrl(control_candidate_ll);
 
-    if ((int64_t)u_sat == u_cand_ll)
+    if ((int64_t)control_sat == control_candidate_ll)
     {
-        i_q30 = i_candidate;
+        integrator_q30 = integrator_candidate;
     }
     else
     {
         // If saturated and error pushes further into saturation, freeze I
-        if (!((u_cand_ll > (int64_t)CTRL_MAX && e_q15 > 0) ||
-              (u_cand_ll < (int64_t)CTRL_MIN && e_q15 < 0)))
+        if (!((control_candidate_ll > (int64_t)CTRL_MAX && err_q15 > 0) ||
+              (control_candidate_ll < (int64_t)CTRL_MIN && err_q15 < 0)))
         {
-            i_q30 = i_candidate;
+            integrator_q30 = integrator_candidate;
         }
     }
 
-    return sat_ctrl((int64_t)u_ff_q30 + (int64_t)p_q30 + (int64_t)i_q30);
+    return sat_ctrl((int64_t)ff_q30 + (int64_t)p_term_q30 + (int64_t)integrator_q30);
 }
 
 void Controller_Reset(void)
 {
-    i_q30 = 0;
-    last_ms = 0;
-    first_call = 1;
+    integrator_q30 = 0;
+    last_update_ms = 0;
+    is_first_call = 1;
 }
