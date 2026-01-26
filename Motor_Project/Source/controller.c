@@ -34,9 +34,8 @@ volatile int32_t U_PER_RPM = 99000;
 volatile int32_t ERR_DEADBAND_RPM = 10;   // ignore tiny error (helps jitter)
 
 // Integrate only when close to target:
-// window = max(INT_WINDOW_MIN_RPM, |ref| * INT_WINDOW_PCT / 100)
-volatile int32_t INT_WINDOW_PCT = 10;     // e.g. 10% of reference
-volatile int32_t INT_WINDOW_MIN_RPM = 80; // minimum window so low refs still integrate
+// if |error| <= INT_WINDOW_RPM then integrator updates
+volatile int32_t INT_WINDOW_RPM = 200;
 
 // Clamp integrator to prevent overflow / windup (Q30 units)
 volatile int32_t I_CLAMP = 300000000;
@@ -124,15 +123,9 @@ int32_t Controller_PIController(const int32_t* reference,
     // P term: Q15 * Q15 -> Q30
     const int32_t p_term = sat_ctrl((int64_t)Kp * (int64_t)err_q15);
 
-    // Integration window scales with reference magnitude.
-    // This prevents strong integral action on large transients.
-    const int32_t ref_abs = iabs32(ref_rpm);
-    int32_t int_window_rpm = (int32_t)(((int64_t)ref_abs * (int64_t)INT_WINDOW_PCT) / 100LL);
-    if (int_window_rpm < INT_WINDOW_MIN_RPM) int_window_rpm = INT_WINDOW_MIN_RPM;
-
     // I update only when close enough (reduces windup on large steps)
     int32_t integrator_candidate = integrator;
-    if (iabs32(err_rpm) <= int_window_rpm)
+    if (iabs32(err_rpm) <= INT_WINDOW_RPM)
     {
         // Integrate with respect to time (ms -> seconds via /1000).
         // di is in Q30 because Ki(Q15) * err(Q15) => Q30.
