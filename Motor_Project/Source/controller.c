@@ -1,41 +1,59 @@
 #include "controller.h"
 #include <stdint.h>
 
+// This file implements a PI controller using ONLY integer math.
+// The controller output is in Q30 fixed-point format:
+//   +2^30-1  => +100% duty (full clockwise)
+//   -2^30    => -100% duty (full counter-clockwise)
+// The application calls Controller_PIController() periodically and provides time.
+
+/* ===================== Units & scaling ===================== */
+
+// Internal control uses signed Q30: full scale = [-2^30, 2^30-1]
+// We use fixed-point (Q30/Q15) because the task forbids floating point,
+// and fixed-point gives predictable, efficient math on the MCU.
+#define CTRL_Q          30
+#define CTRL_MAX        ((int32_t)0x3FFFFFFF)
+#define CTRL_MIN        ((int32_t)0xC0000000)
+#define Q15_ONE         32768
+
 /* ===================== Config (tune in Watch) ===================== */
 
-// Normalize rpm error into Q15
+// Normalize RPM error into Q15 before applying gains.
+// Example: RPM_SCALE = 4000 means 4000 RPM maps to ~1.0 in Q15.
 #define RPM_SCALE  4000
 
 // PI gains in Q15 (0..32767 ~ 0..1.0)
-volatile int32_t Kp_q15 = 1300;
-volatile int32_t Ki_q15 = 4000;     // start here once P is stable
+volatile int32_t Kp = 1300;
+volatile int32_t Ki = 4000;       // start here once P is stable
 
-// If you want PI-only, keep this 0
-#define USE_FEEDFORWARD  1
-volatile int32_t U_PER_RPM = 99000; // only used if USE_FEEDFORWARD=1
+// Feedforward: set to 0 to disable. Units: Q30 per RPM.
+volatile int32_t U_PER_RPM = 99000;
 
 // Noise handling
 volatile int32_t ERR_DEADBAND_RPM = 10;   // ignore tiny error (helps jitter)
 
 // Integrate only when close to target:
-// window = max(ABS_INT_WINDOW_RPM, |ref| * INT_WINDOW_PCT / 100)
+// window = max(INT_WINDOW_MIN_RPM, |ref| * INT_WINDOW_PCT / 100)
 volatile int32_t INT_WINDOW_PCT = 10;     // e.g. 10% of reference
-volatile int32_t ABS_INT_WINDOW_RPM = 80; // minimum window so low refs still integrate
+volatile int32_t INT_WINDOW_MIN_RPM = 80; // minimum window so low refs still integrate
 
 // Clamp integrator to prevent overflow / windup (Q30 units)
-volatile int32_t I_CLAMP_Q30 = 300000000;
+volatile int32_t I_CLAMP = 300000000;
 
-/* ===================== Constants / state ===================== */
+/* ===================== Controller state ===================== */
 
-#define CTRL_MAX   ((int32_t)0x3FFFFFFF)
-#define CTRL_MIN   ((int32_t)0xC0000000)
-
-static int32_t  integrator_q30 = 0;
+// Integrator state in Q30
+static int32_t  integrator = 0;
+// Time of previous control update (ms)
 static uint32_t last_update_ms = 0;
-static uint8_t  is_first_call = 1;
+// Used to force "first call after reset returns 0"
+static uint8_t  first_call = 1;
 
 /* ===================== Helpers ===================== */
 
+// Saturate to the valid controller output range (Q30).
+// We use 64-bit inputs to avoid overflow during intermediate math.
 static inline int32_t sat_ctrl(int64_t x)
 {
     if (x > (int64_t)CTRL_MAX) return CTRL_MAX;
@@ -43,6 +61,7 @@ static inline int32_t sat_ctrl(int64_t x)
     return (int32_t)x;
 }
 
+// Clamp to signed 16-bit range used by Q15.
 static inline int32_t clamp_q15(int64_t x)
 {
     if (x >  32767) return  32767;
@@ -50,11 +69,13 @@ static inline int32_t clamp_q15(int64_t x)
     return (int32_t)x;
 }
 
+// Integer absolute value (32-bit).
 static inline int32_t iabs32(int32_t x)
 {
     return (x < 0) ? -x : x;
 }
 
+// Clamp to [lo, hi].
 static inline int32_t clamp_i32(int32_t x, int32_t lo, int32_t hi)
 {
     if (x > hi) return hi;
@@ -68,76 +89,83 @@ int32_t Controller_PIController(const int32_t* reference,
                                 const int32_t* measured,
                                 const uint32_t* millisec)
 {
-    if (is_first_call)
+    // First call after reset must return zero and initialize state.
+    if (first_call)
     {
-        is_first_call = 0;
+        first_call = 0;
         last_update_ms = *millisec;
-        integrator_q30 = 0;
+        integrator = 0;
         return 0;
     }
 
-    uint32_t delta_ms = *millisec - last_update_ms;
-    last_update_ms = *millisec;
-    if (delta_ms == 0U) return 0;
+    // Compute elapsed time (ms) since last controller update.
+    // Unsigned subtraction handles timer wrap-around correctly.
+    const uint32_t now_ms = *millisec;
+    const uint32_t delta_ms = now_ms - last_update_ms;
+    last_update_ms = now_ms;
+    if (delta_ms == 0U) return 0;  // avoid divide-by-zero and double-update
 
-    int32_t ref_rpm = *reference;
-    int32_t meas_rpm = *measured;
+    // Read inputs once (pass-by-reference in API).
+    const int32_t ref_rpm = *reference;
+    const int32_t meas_rpm = *measured;
     int32_t err_rpm = ref_rpm - meas_rpm;
 
     // Deadband for noise
-    if (iabs32(err_rpm) <= ERR_DEADBAND_RPM)
-        err_rpm = 0;
-
-    // Optional feedforward
-    int32_t ff_q30 = 0;
-#if USE_FEEDFORWARD
-    ff_q30 = sat_ctrl((int64_t)U_PER_RPM * (int64_t)ref_rpm);
-#endif
+    if (iabs32(err_rpm) <= ERR_DEADBAND_RPM) err_rpm = 0;
 
     // Normalize error to Q15
-    int32_t err_q15 = clamp_q15(((int64_t)err_rpm * 32768LL) / (int64_t)RPM_SCALE);
+    // err_q15 ~= err_rpm / RPM_SCALE, scaled by 2^15
+    const int32_t err_q15 = clamp_q15(((int64_t)err_rpm * (int64_t)Q15_ONE) / (int64_t)RPM_SCALE);
 
-    // P term: Q15*Q15 -> Q30 units
-    int32_t p_term_q30 = sat_ctrl((int64_t)Kp_q15 * (int64_t)err_q15);
+    // Feedforward (set U_PER_RPM = 0 to disable)
+    // Units: (Q30 per RPM) * RPM = Q30
+    const int32_t ff = sat_ctrl((int64_t)U_PER_RPM * (int64_t)ref_rpm);
 
-    // Integration window scales with reference magnitude
-    int32_t ref_abs = iabs32(ref_rpm);
+    // P term: Q15 * Q15 -> Q30
+    const int32_t p_term = sat_ctrl((int64_t)Kp * (int64_t)err_q15);
+
+    // Integration window scales with reference magnitude.
+    // This prevents strong integral action on large transients.
+    const int32_t ref_abs = iabs32(ref_rpm);
     int32_t int_window_rpm = (int32_t)(((int64_t)ref_abs * (int64_t)INT_WINDOW_PCT) / 100LL);
-    if (int_window_rpm < ABS_INT_WINDOW_RPM) int_window_rpm = ABS_INT_WINDOW_RPM;
+    if (int_window_rpm < INT_WINDOW_MIN_RPM) int_window_rpm = INT_WINDOW_MIN_RPM;
 
-    // I update only when close enough
-    int32_t integrator_candidate = integrator_q30;
+    // I update only when close enough (reduces windup on large steps)
+    int32_t integrator_candidate = integrator;
     if (iabs32(err_rpm) <= int_window_rpm)
     {
-        int64_t di_q30 = ((int64_t)Ki_q15 * (int64_t)err_q15 * (int64_t)delta_ms) / 1000LL;
-        integrator_candidate = sat_ctrl((int64_t)integrator_q30 + di_q30);
-        integrator_candidate = clamp_i32(integrator_candidate, -I_CLAMP_Q30, I_CLAMP_Q30);
+        // Integrate with respect to time (ms -> seconds via /1000).
+        // di is in Q30 because Ki(Q15) * err(Q15) => Q30.
+        const int64_t di = ((int64_t)Ki * (int64_t)err_q15 * (int64_t)delta_ms) / 1000LL;
+        integrator_candidate = sat_ctrl((int64_t)integrator + di);
+        integrator_candidate = clamp_i32(integrator_candidate, -I_CLAMP, I_CLAMP);
     }
 
-    // Anti-windup using saturation check
-    int64_t control_candidate_ll = (int64_t)ff_q30 + (int64_t)p_term_q30 + (int64_t)integrator_candidate;
-    int32_t control_sat = sat_ctrl(control_candidate_ll);
-
-    if ((int64_t)control_sat == control_candidate_ll)
+    // Anti-windup: only commit I when output does not saturate further
+    const int64_t ctrl_candidate = (int64_t)ff + (int64_t)p_term + (int64_t)integrator_candidate;
+    const int32_t ctrl_sat = sat_ctrl(ctrl_candidate);
+    if ((int64_t)ctrl_sat == ctrl_candidate)
     {
-        integrator_q30 = integrator_candidate;
+        // Not saturated -> accept integrator update.
+        integrator = integrator_candidate;
     }
     else
     {
-        // If saturated and error pushes further into saturation, freeze I
-        if (!((control_candidate_ll > (int64_t)CTRL_MAX && err_q15 > 0) ||
-              (control_candidate_ll < (int64_t)CTRL_MIN && err_q15 < 0)))
-        {
-            integrator_q30 = integrator_candidate;
-        }
+        // Saturated: only accept I if it moves away from saturation.
+        const uint8_t pushes_further =
+            (ctrl_candidate > (int64_t)CTRL_MAX && err_q15 > 0) ||
+            (ctrl_candidate < (int64_t)CTRL_MIN && err_q15 < 0);
+        if (!pushes_further) integrator = integrator_candidate;
     }
 
-    return sat_ctrl((int64_t)ff_q30 + (int64_t)p_term_q30 + (int64_t)integrator_q30);
+    // Final control output (Q30).
+    return sat_ctrl((int64_t)ff + (int64_t)p_term + (int64_t)integrator);
 }
 
 void Controller_Reset(void)
 {
-    integrator_q30 = 0;
+    // Reset internal state so the next PI call returns 0 once.
+    integrator = 0;
     last_update_ms = 0;
-    is_first_call = 1;
+    first_call = 1;
 }
