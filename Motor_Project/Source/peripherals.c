@@ -30,7 +30,6 @@ volatile int32_t g_vel_window_ms = 40U;
 // Raw (unaveraged) velocity in RPM for debugging/Watch.
 volatile int32_t g_vel_raw_rpm = 0;
 
-
 /* ----------------- Aliases ----------------- */
 
 // Aliases make the intent clearer at call sites.
