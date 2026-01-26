@@ -62,7 +62,16 @@ static inline int32_t clamp_ctrl(int32_t x) {
 static inline uint32_t ctrl_to_counts(int32_t ctrl, uint32_t top) {
     const int32_t sat = clamp_ctrl(ctrl);
     // Handle CTRL_MIN specially to avoid overflow when negating.
-    const uint32_t mag = (sat == CTRL_MIN) ? CTRL_MAG_MAX : (uint32_t)((sat < 0) ? -sat : sat);
+    uint32_t mag = 0U;
+    if (sat == CTRL_MIN) {
+        mag = CTRL_MAG_MAX;
+    } else {
+        if (sat < 0) {
+            mag = (uint32_t)(-sat);
+        } else {
+            mag = (uint32_t)sat;
+        }
+    }
     uint32_t duty = (uint32_t)(((uint64_t)mag * (uint64_t)top) >> CTRL_Q);
     if (duty > (top - 1U))
         duty = top - 1U;
@@ -162,7 +171,11 @@ int32_t Peripheral_Encoder_CalculateVelocity(uint32_t ms) {
 
     // Add new sample
     delta_count_buf[buf_index] = delta_count;
-    delta_ms_buf[buf_index] = (delta_ms > 65535U) ? 65535U : (uint16_t)delta_ms;
+    if (delta_ms > 65535U) {
+        delta_ms_buf[buf_index] = 65535U;
+    } else {
+        delta_ms_buf[buf_index] = (uint16_t)delta_ms;
+    }
     sum_delta_count += (int32_t)delta_count_buf[buf_index];
     sum_delta_ms += (uint32_t)delta_ms_buf[buf_index];
 

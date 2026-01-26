@@ -71,7 +71,11 @@ static inline int32_t clamp_q15(int64_t x)
 // Integer absolute value (32-bit).
 static inline int32_t iabs32(int32_t x)
 {
-    return (x < 0) ? -x : x;
+    if (x < 0)
+    {
+        return -x;
+    }
+    return x;
 }
 
 // Clamp to [lo, hi].
@@ -112,7 +116,7 @@ int32_t Controller_PIController(const int32_t* reference,
     // Deadband for noise
     if (iabs32(err_rpm) <= ERR_DEADBAND_RPM) err_rpm = 0;
 
-    // Normalize error to Q15
+    // Normalize error to Q15 so Q15*Q15 -> Q30 (matches control output format).
     // err_q15 ~= err_rpm / RPM_SCALE, scaled by 2^15
     const int32_t err_q15 = clamp_q15(((int64_t)err_rpm * (int64_t)Q15_ONE) / (int64_t)RPM_SCALE);
 
