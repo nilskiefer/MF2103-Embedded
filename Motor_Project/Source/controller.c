@@ -24,7 +24,7 @@
 #define RPM_SCALE 6000
 
 // PI gains in Q15 (0..32767 ~ 0..1.0)
-volatile int32_t Kp = 1950;
+volatile int32_t Kp = 100;
 volatile int32_t Ki = 6000; // start here once P is stable
 
 // Feedforward: set to 0 to disable. Units: Q30 per RPM.
